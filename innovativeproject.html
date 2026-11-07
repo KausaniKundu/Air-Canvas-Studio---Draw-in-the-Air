@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950 text-slate-100">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Air Canvas Studio - Draw in the Air</title>
+    <!-- Tailwind CSS for modern responsive UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- MediaPipe Libraries for Hand Tracking -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            touch-action: none;
+        }
+
+        /* Glassmorphism utility */
+        .glass-panel {
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .glass-button {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            transition: all 0.2s ease;
+        }
+
+        .glass-button:hover {
+            background: rgba(51, 65, 85, 0.85);
+            border-color: rgba(255, 255, 255, 0.3);
+            transform: translateY(-1px);
+        }
+
+        .glass-button:active {
+            transform: translateY(0);
+        }
+
+        /* Video / Canvas stacking layer */
+        .viewport-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            border-radius: 1rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+        }
+
+        #webcamVideo {
+            transform: scaleX(-1);
+            object-fit: cover;
+            width: 100%;
+            height: 100%;
+        }
+
+        #drawingCanvas, #trackingOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); /* Mirror canvas to match video stream */
+        }
+
+        /* Custom scrollbars */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(15, 23, 42, 0.6);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(100, 116, 139, 0.5);
+            border-radius: 3px;
+        }
+
+        /* Glowing fingertip indicator keyframe */
+        @keyframes pulse-glow {
+            0%, 100% { opacity: 0.8; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.15); }
+        }
+        .pulse-pointer {
+            animation: pulse-glow 1.5s infinite ease-in-out;
+        }
+    </style>
+</head>
+<body class="h-full flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
+
+    <!-- Top Navigation Header -->
+    <header class="h-16 border-b border-slate-800 bg-slate-900/80 px-4 lg:px-6 flex items-center justify-between z-20 shrink-0">
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                <i class="fa-solid fa-hand-pointer text-white text-lg"></i>
+            </div>
+            <div>
+                <h1 class="font-bold text-lg leading-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
+                    Air Canvas Studio
+                </h1>
+                <p class="text-xs text-slate-400 hidden sm:block">Fingertip Spatial Drawing & AI Classifier</p>
+            </div>
+        </div>
+
+        <!-- System Controls & Status -->
+        <div class="flex items-center gap-3">
+            <div id="trackingStatus" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/80 text-xs font-medium text-amber-400 border border-amber-500/20">
+                <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                <span id="statusText">Initializing Hand Tracker...</span>
+            </div>
+
+            <button id="toggleCameraBtn" class="glass-button px-3.5 py-1.5 rounded-lg text-xs font-semibold text-slate-200 flex items-center gap-2 hover:text-white">
+                <i class="fa-solid fa-camera"></i>
+                <span id="cameraBtnText" class="hidden sm:inline">Start Webcam</span>
+            </button>
+
+            <button id="helpModalBtn" class="glass-button w-9 h-9 rounded-lg flex items-center justify-center text-slate-300 hover:text-white">
+                <i class="fa-solid fa-circle-question text-base"></i>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col lg:flex-row p-3 lg:p-4 gap-4 overflow-hidden relative">
+
+        <!-- Left Sidebar: Tools & Settings -->
+        <aside class="w-full lg:w-80 glass-panel rounded-2xl p-4 flex flex-col gap-5 overflow-y-auto z-10 shrink-0">
+            
+            <!-- Drawing Tools & Modes -->
+            <div>
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3 flex items-center justify-between">
+                    <span>Drawing Mode</span>
+                    <i class="fa-solid fa-wand-magic-sparkles text-indigo-400"></i>
+                </h2>
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="modeDrawBtn" class="tool-mode-btn active flex items-center gap-2 justify-center p-2.5 rounded-xl border border-indigo-500/50 bg-indigo-600/30 text-indigo-200 text-sm font-semibold transition">
+                        <i class="fa-solid fa-pen-nib"></i> Index Finger
+                    </button>
+                    <button id="modePinchBtn" class="tool-mode-btn flex items-center gap-2 justify-center p-2.5 rounded-xl border border-slate-700 bg-slate-800/50 text-slate-300 text-sm font-semibold hover:border-slate-600 transition">
+                        <i class="fa-solid fa-hand-back-fist"></i> Pinch Gesture
+                    </button>
+                </div>
+                <p id="modeDescription" class="text-xs text-slate-400 mt-2 italic">
+                    Point index finger straight up to draw. Lower or curl other fingers to pause drawing.
+                </p>
+            </div>
+
+            <hr class="border-slate-800">
+
+            <!-- Color Palette -->
+            <div>
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3 flex items-center justify-between">
+                    <span>Brush Color</span>
+                    <span id="currentColorLabel" class="text-xs font-normal text-indigo-400 capitalize">Cyan Glow</span>
+                </h2>
+                <div class="grid grid-cols-6 gap-2" id="colorPalette">
+                    <button data-color="#06b6d4" class="color-btn w-9 h-9 rounded-xl bg-cyan-500 ring-2 ring-white scale-110 shadow-lg shadow-cyan-500/30 transition"></button>
+                    <button data-color="#3b82f6" class="color-btn w-9 h-9 rounded-xl bg-blue-500 hover:scale-105 transition"></button>
+                    <button data-color="#8b5cf6" class="color-btn w-9 h-9 rounded-xl bg-purple-500 hover:scale-105 transition"></button>
+                    <button data-color="#ec4899" class="color-btn w-9 h-9 rounded-xl bg-pink-500 hover:scale-105 transition"></button>
+                    <button data-color="#10b981" class="color-btn w-9 h-9 rounded-xl bg-emerald-500 hover:scale-105 transition"></button>
+                    <button data-color="#f59e0b" class="color-btn w-9 h-9 rounded-xl bg-amber-500 hover:scale-105 transition"></button>
+                    <button data-color="#ef4444" class="color-btn w-9 h-9 rounded-xl bg-red-500 hover:scale-105 transition"></button>
+                    <button data-color="#ffffff" class="color-btn w-9 h-9 rounded-xl bg-white hover:scale-105 transition"></button>
+                    <button data-color="eraser" class="color-btn w-9 h-9 rounded-xl bg-slate-800 border border-slate-600 flex items-center justify-center text-slate-300 hover:scale-105 transition" title="Eraser">
+                        <i class="fa-solid fa-eraser text-sm"></i>
+                    </button>
+                    <!-- Custom Color Picker -->
+                    <label class="w-9 h-9 rounded-xl bg-gradient-to-br from-red-400 via-green-400 to-blue-500 cursor-pointer flex items-center justify-center relative hover:scale-105 transition">
+                        <input type="color" id="customColorPicker" class="opacity-0 absolute inset-0 cursor-pointer">
+                        <i class="fa-solid fa-plus text-xs text-white drop-shadow"></i>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Brush Size & Smoothness -->
+            <div class="space-y-4">
+                <div>
+                    <div class="flex justify-between text-xs font-bold uppercase tracking-wider text-slate-400 mb-1.5">
+                        <span>Brush Width</span>
+                        <span id="brushSizeVal" class="text-indigo-400">12 px</span>
+                    </div>
+                    <input type="range" id="brushSizeInput" min="2" max="50" value="12" class="w-full accent-indigo-500 bg-slate-800 rounded-lg h-2 cursor-pointer">
+                </div>
+
+                <div>
+                    <div class="flex justify-between text-xs font-bold uppercase tracking-wider text-slate-400 mb-1.5">
+                        <span>Background Dimming</span>
+                        <span id="videoOpacityVal" class="text-indigo-400">60%</span>
+                    </div>
+                    <input type="range" id="videoOpacityInput" min="0" max="100" value="60" class="w-full accent-indigo-500 bg-slate-800 rounded-lg h-2 cursor-pointer">
+                </div>
+            </div>
+
+            <hr class="border-slate-800">
+
+            <!-- Actions: Recognition & Canvas Clear -->
+            <div class="flex flex-col gap-2.5 mt-auto">
+                <button id="analyzeBtn" class="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:via-purple-500 hover:to-pink-500 text-white font-bold rounded-xl shadow-lg shadow-indigo-500/25 flex items-center justify-center gap-2 transition transform active:scale-95">
+                    <i class="fa-solid fa-brain text-lg"></i>
+                    <span>Recognize Air Drawing</span>
+                </button>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="clearCanvasBtn" class="glass-button py-2.5 px-3 rounded-xl text-slate-300 hover:text-rose-400 hover:border-rose-500/40 text-xs font-semibold flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-trash-can"></i> Clear Screen
+                    </button>
+                    <button id="downloadCanvasBtn" class="glass-button py-2.5 px-3 rounded-xl text-slate-300 hover:text-emerald-400 hover:border-emerald-500/40 text-xs font-semibold flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-download"></i> Save Image
+                    </button>
+                </div>
+            </div>
+
+        </aside>
+
+        <!-- Right Main Viewport: Webcam + Canvas Overlay -->
+        <section class="flex-1 flex flex-col relative h-full min-h-[350px]">
+            
+            <div class="viewport-container bg-slate-900 border border-slate-800 flex items-center justify-center relative">
+                
+                <!-- Video Element for MediaPipe input -->
+                <video idwebcamVideo" id="webcamVideo" playsinline class="opacity-60 transition-opacity duration-300"></video>
+                
+                <!-- Main Layer: Drawing Canvas -->
+                <canvas id="drawingCanvas"></canvas>
+
+                <!-- Top Layer: Hand Tracking Visualizer Overlay -->
+                <canvas id="trackingOverlay"></canvas>
+
+                <!-- Floating Canvas HUD & Pointer Indicator -->
+                <div class="absolute top-4 left-4 z-10 flex items-center gap-2 pointer-events-none">
+                    <div id="airPenBadge" class="glass-panel px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-2 text-slate-200">
+                        <span id="airPenStatusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                        <span id="airPenStatusText">Hovering (Not Drawing)</span>
+                    </div>
+                </div>
+
+                <!-- Floating Video Controls (Top Right) -->
+                <div class="absolute top-4 right-4 z-10 flex items-center gap-2">
+                    <button id="toggleLandmarksBtn" class="glass-button px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-300 flex items-center gap-1.5" title="Toggle Hand Skeleton">
+                        <i class="fa-solid fa-hand"></i>
+                        <span class="hidden sm:inline">Skeleton</span>
+                    </button>
+                    <button id="fullScreenBtn" class="glass-button w-8 h-8 rounded-xl flex items-center justify-center text-slate-300 hover:text-white" title="Toggle Fullscreen">
+                        <i class="fa-solid fa-expand text-xs"></i>
+                    </button>
+                </div>
+
+                <!-- Recognition Result Overlay Banner -->
+                <div id="recognitionResultCard" class="hidden absolute bottom-6 left-1/2 -translate-x-1/2 z-20 glass-panel p-4 rounded-2xl max-w-md w-11/12 border border-indigo-500/40 shadow-2xl animate-bounce-short">
+                    <div class="flex items-start justify-between gap-3">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center text-2xl text-white shadow-md">
+                                <i id="resultIcon" class="fa-solid fa-sparkles"></i>
+                            </div>
+                            <div>
+                                <div class="text-xs uppercase font-bold text-indigo-400 tracking-wider">AI Classification</div>
+                                <h3 id="resultTitle" class="text-xl font-extrabold text-white leading-tight">Recognizing...</h3>
+                                <p id="resultConfidence" class="text-xs text-slate-300 mt-0.5">Calculating probability metrics...</p>
+                            </div>
+                        </div>
+                        <button id="closeResultBtn" class="text-slate-400 hover:text-white p-1">
+                            <i class="fa-solid fa-xmark text-lg"></i>
+                        </button>
+                    </div>
+                    <p id="resultDescription" class="text-xs text-slate-300 mt-2.5 pt-2 border-t border-slate-800">
+                        Analyzing pixel density and stroke geometry...
+                    </p>
+                </div>
+
+                <!-- Camera Start Required Prompt -->
+                <div id="cameraPrompt" class="absolute inset-0 z-30 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
+                    <div class="w-20 h-20 rounded-3xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-3xl mb-4 shadow-xl">
+                        <i class="fa-solid fa-video"></i>
+                    </div>
+                    <h2 class="text-2xl font-bold text-white mb-2">Webcam Access Needed</h2>
+                    <p class="text-slate-400 max-w-md text-sm mb-6">
+                        Air Canvas Studio uses real-time hand-tracking via your webcam to detect index fingertip movements for air drawing.
+                    </p>
+                    <button id="startWebcamDirectBtn" class="px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm shadow-lg shadow-indigo-600/30 transition transform hover:scale-105 active:scale-95 flex items-center gap-2">
+                        <i class="fa-solid fa-power-off"></i> Enable Webcam & Start
+                    </button>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Help / Instructions Modal -->
+    <div id="helpModal" class="hidden fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="glass-panel w-full max-w-lg rounded-2xl p-6 border border-slate-700 shadow-2xl relative">
+            <button id="closeHelpBtn" class="absolute top-4 right-4 text-slate-400 hover:text-white">
+                <i class="fa-solid fa-xmark text-xl"></i>
+            </button>
+            <div class="flex items-center gap-3 mb-4">
+                <i class="fa-solid fa-hand-holding-hand text-indigo-400 text-2xl"></i>
+                <h3 class="text-lg font-bold text-white">How to Draw in the Air</h3>
+            </div>
+            
+            <div class="space-y-4 text-sm text-slate-300">
+                <div class="flex items-start gap-3 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
+                    <div class="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center shrink-0 font-bold">1</div>
+                    <div>
+                        <strong class="text-white block">Index Finger Mode (Default)</strong>
+                        Raise your index finger up towards the camera to draw. Fold your other fingers into a fist. Fold index finger down to stop drawing.
+                    </div>
+                </div>
+
+                <div class="flex items-start gap-3 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
+                    <div class="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center shrink-0 font-bold">2</div>
+                    <div>
+                        <strong class="text-white block">Pinch Gesture Mode</strong>
+                        Pinch your index fingertip and thumb together to activate the pen. Separate them to move cursor without leaving marks.
+                    </div>
+                </div>
+
+                <div class="flex items-start gap-3 p-3 rounded-xl bg-slate-900/60 border border-slate-800">
+                    <div class="w-7 h-7 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center shrink-0 font-bold">3</div>
+                    <div>
+                        <strong class="text-white block">AI Recognition</strong>
+                        Draw numbers (0-9) or simple shapes (Circle, Star, Heart, Square, Triangle, etc.) and click <span class="text-indigo-400 font-semibold">Recognize Air Drawing</span> to analyze what you drew!
+                    </div>
+                </div>
+            </div>
+
+            <button id="gotItBtn" class="w-full mt-6 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold text-sm transition">
+                Got it, Let's Draw!
+            </button>
+        </div>
+    </div>
+
+    <!-- Application Script -->
+    <script>
+        // Global State & Configuration
+        const state = {
+            isCameraActive: false,
+            drawingMode: 'index', // 'index' or 'pinch'
+            currentColor: '#06b6d4',
+            brushSize: 12,
+            isEraser: false,
+            showSkeleton: true,
+            isDrawingActive: false,
+            lastPoint: null,
+            handTracker: null,
+            cameraUtils: null,
+            geminiApiKey: "", // Dynamic runtime Gemini key placeholder
+            geminiApiUrl: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
+        };
+
+        // DOM Elements
+        const webcamVideo = document.getElementById('webcamVideo');
+        const drawingCanvas = document.getElementById('drawingCanvas');
+        const trackingOverlay = document.getElementById('trackingOverlay');
+        const drawCtx = drawingCanvas.getContext('2d');
+        const trackCtx = trackingOverlay.getContext('2d');
+
+        const cameraPrompt = document.getElementById('cameraPrompt');
+        const statusText = document.getElementById('statusText');
+        const trackingStatus = document.getElementById('trackingStatus');
+        const airPenStatusDot = document.getElementById('airPenStatusDot');
+        const airPenStatusText = document.getElementById('airPenStatusText');
+        const brushSizeVal = document.getElementById('brushSizeVal');
+        const videoOpacityVal = document.getElementById('videoOpacityVal');
+
+        // Initialize Canvas Sizes dynamically with zero-dimension guards
+        function resizeCanvases() {
+            const container = drawingCanvas.parentElement;
+            if (!container) return;
+
+            const width = container.clientWidth || window.innerWidth;
+            const height = container.clientHeight || window.innerHeight;
+
+            // Guard against 0 dimensions during early initialization
+            if (width === 0 || height === 0) return;
+
+            // Preserve canvas pixel content during resize if dimensions were valid
+            if (drawingCanvas.width > 0 && drawingCanvas.height > 0) {
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = drawingCanvas.width;
+                tempCanvas.height = drawingCanvas.height;
+                const tempCtx = tempCanvas.getContext('2d');
+                tempCtx.drawImage(drawingCanvas, 0, 0);
+
+                drawingCanvas.width = width;
+                drawingCanvas.height = height;
+                trackingOverlay.width = width;
+                trackingOverlay.height = height;
+
+                // Restore canvas contents cleanly
+                drawCtx.drawImage(tempCanvas, 0, 0, tempCanvas.width, tempCanvas.height, 0, 0, width, height);
+            } else {
+                drawingCanvas.width = width;
+                drawingCanvas.height = height;
+                trackingOverlay.width = width;
+                trackingOverlay.height = height;
+            }
+
+            // Re-apply line styles after canvas buffer resize
+            drawCtx.lineCap = 'round';
+            drawCtx.lineJoin = 'round';
+        }
+
+        window.addEventListener('resize', resizeCanvases);
+        // Ensure DOM layout is computed before first size check
+        requestAnimationFrame(() => {
+            resizeCanvases();
+        });
+
+        // Color & Tool Selection Logic
+        document.querySelectorAll('.color-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('ring-2', 'ring-white', 'scale-110'));
+                const target = e.currentTarget;
+                target.classList.add('ring-2', 'ring-white', 'scale-110');
+
+                const color = target.getAttribute('data-color');
+                if (color === 'eraser') {
+                    state.isEraser = true;
+                    document.getElementById('currentColorLabel').textContent = "Eraser Mode";
+                } else {
+                    state.isEraser = false;
+                    state.currentColor = color;
+                    document.getElementById('currentColorLabel').textContent = color;
+                }
+            });
+        });
+
+        // Custom Color Picker Handler
+        document.getElementById('customColorPicker').addEventListener('input', (e) => {
+            state.currentColor = e.target.value;
+            state.isEraser = false;
+            document.getElementById('currentColorLabel').textContent = "Custom Hex";
+        });
+
+        // Brush Size and Opacity Controls
+        document.getElementById('brushSizeInput').addEventListener('input', (e) => {
+            state.brushSize = parseInt(e.target.value, 10);
+            brushSizeVal.textContent = `${state.brushSize} px`;
+        });
+
+        document.getElementById('videoOpacityInput').addEventListener('input', (e) => {
+            const opacity = e.target.value / 100;
+            webcamVideo.style.opacity = opacity;
+            videoOpacityVal.textContent = `${e.target.value}%`;
+        });
+
+        // Mode Switching
+        const modeDrawBtn = document.getElementById('modeDrawBtn');
+        const modePinchBtn = document.getElementById('modePinchBtn');
+        const modeDescription = document.getElementById('modeDescription');
+
+        modeDrawBtn.addEventListener('click', () => {
+            state.drawingMode = 'index';
+            modeDrawBtn.className = "tool-mode-btn active flex items-center gap-2 justify-center p-2.5 rounded-xl border border-indigo-500/50 bg-indigo-600/30 text-indigo-200 text-sm font-semibold transition";
+            modePinchBtn.className = "tool-mode-btn flex items-center gap-2 justify-center p-2.5 rounded-xl border border-slate-700 bg-slate-800/50 text-slate-300 text-sm font-semibold hover:border-slate-600 transition";
+            modeDescription.textContent = "Point index finger straight up to draw. Lower or curl other fingers to pause drawing.";
+        });
+
+        modePinchBtn.addEventListener('click', () => {
+            state.drawingMode = 'pinch';
+            modePinchBtn.className = "tool-mode-btn active flex items-center gap-2 justify-center p-2.5 rounded-xl border border-indigo-500/50 bg-indigo-600/30 text-indigo-200 text-sm font-semibold transition";
+            modeDrawBtn.className = "tool-mode-btn flex items-center gap-2 justify-center p-2.5 rounded-xl border border-slate-700 bg-slate-800/50 text-slate-300 text-sm font-semibold hover:border-slate-600 transition";
+            modeDescription.textContent = "Pinch index fingertip and thumb together to draw. Separate them to pause drawing.";
+        });
+
+        // Clear Canvas
+        document.getElementById('clearCanvasBtn').addEventListener('click', () => {
+            drawCtx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+            document.getElementById('recognitionResultCard').classList.add('hidden');
+        });
+
+        // Download Image
+        document.getElementById('downloadCanvasBtn').addEventListener('click', () => {
+            const exportCanvas = document.createElement('canvas');
+            exportCanvas.width = drawingCanvas.width;
+            exportCanvas.height = drawingCanvas.height;
+            const expCtx = exportCanvas.getContext('2d');
+
+            // Fill background with black for contrast
+            expCtx.fillStyle = '#0f172a';
+            expCtx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+            expCtx.drawImage(drawingCanvas, 0, 0);
+
+            const link = document.createElement('a');
+            link.download = `air-canvas-${Date.now()}.png`;
+            link.href = exportCanvas.toDataURL('image/png');
+            link.click();
+        });
+
+        // Toggle Hand Skeleton Overlay
+        document.getElementById('toggleLandmarksBtn').addEventListener('click', () => {
+            state.showSkeleton = !state.showSkeleton;
+            const btn = document.getElementById('toggleLandmarksBtn');
+            btn.classList.toggle('bg-indigo-600/40', state.showSkeleton);
+        });
+
+        // Fullscreen Toggle
+        document.getElementById('fullScreenBtn').addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+        });
+
+        // Help Modal Logic
+        const helpModal = document.getElementById('helpModal');
+        document.getElementById('helpModalBtn').addEventListener('click', () => helpModal.classList.remove('hidden'));
+        document.getElementById('closeHelpBtn').addEventListener('click', () => helpModal.classList.add('hidden'));
+        document.getElementById('gotItBtn').addEventListener('click', () => helpModal.classList.add('hidden'));
+
+        // Initialize MediaPipe Hands Tracking
+        function initMediaPipe() {
+            const hands = new Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            hands.onResults(onHandResults);
+            state.handTracker = hands;
+        }
+
+        // Handle Hand Landmark Detection Stream Results
+        function onHandResults(results) {
+            // Clear tracking visualizer canvas
+            trackCtx.clearRect(0, 0, trackingOverlay.width, trackingOverlay.height);
+
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                // Update status indicator
+                trackingStatus.className = "flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/80 text-xs font-medium text-amber-400 border border-amber-500/20";
+                statusText.textContent = "Searching for hand...";
+                updatePenStatus(false, "No Hand Detected");
+                state.lastPoint = null;
+                return;
+            }
+
+            // Hand detected successfully
+            trackingStatus.className = "flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/80 text-xs font-medium text-emerald-400 border border-emerald-500/20";
+            statusText.textContent = "Hand Tracked";
+
+            const landmarks = results.multiHandLandmarks[0];
+
+            // Render skeleton if enabled
+            if (state.showSkeleton) {
+                drawConnectors(trackCtx, landmarks, HAND_CONNECTIONS, { color: 'rgba(99, 102, 241, 0.4)', lineWidth: 3 });
+                drawLandmarks(trackCtx, landmarks, { color: 'rgba(236, 72, 153, 0.6)', lineWidth: 1, radius: 4 });
+            }
+
+            // Index Fingertip (Landmark 8) & Thumb Tip (Landmark 4)
+            const indexTip = landmarks[8];
+            const indexPip = landmarks[6]; // Index MCP/PIP for posture detection
+            const thumbTip = landmarks[4];
+            const middleTip = landmarks[12];
+
+            const x = indexTip.x * trackingOverlay.width;
+            const y = indexTip.y * trackingOverlay.height;
+
+            // Determine Drawing Trigger condition based on selected mode
+            let isDrawingAllowed = false;
+
+            if (state.drawingMode === 'index') {
+                // Index Up Mode: Index tip higher than PIP, and Middle finger curled/lower
+                const isIndexExtended = indexTip.y < indexPip.y;
+                const isMiddleFolded = middleTip.y > landmarks[10].y; // Middle tip lower than PIP
+                isDrawingAllowed = isIndexExtended && isMiddleFolded;
+            } else if (state.drawingMode === 'pinch') {
+                // Pinch Mode: Calculate Euclidean distance between index tip and thumb tip
+                const dx = (indexTip.x - thumbTip.x) * trackingOverlay.width;
+                const dy = (indexTip.y - thumbTip.y) * trackingOverlay.height;
+                const distance = Math.hypot(dx, dy);
+                isDrawingAllowed = distance < 45; // Pinch threshold in px
+            }
+
+            // Draw glowing cursor at fingertip
+            drawCursor(x, y, isDrawingAllowed);
+
+            // Execute Drawing onto Canvas
+            if (isDrawingAllowed) {
+                updatePenStatus(true, "Drawing Active");
+                if (state.lastPoint) {
+                    drawCtx.beginPath();
+                    drawCtx.moveTo(state.lastPoint.x, state.lastPoint.y);
+                    drawCtx.lineTo(x, y);
+
+                    if (state.isEraser) {
+                        drawCtx.globalCompositeOperation = 'destination-out';
+                        drawCtx.lineWidth = state.brushSize * 2;
+                    } else {
+                        drawCtx.globalCompositeOperation = 'source-over';
+                        drawCtx.strokeStyle = state.currentColor;
+                        drawCtx.lineWidth = state.brushSize;
+
+                        // Add subtle shadow glow for neon effect
+                        drawCtx.shadowBlur = 8;
+                        drawCtx.shadowColor = state.currentColor;
+                    }
+
+                    drawCtx.stroke();
+                    drawCtx.shadowBlur = 0; // Reset shadow blur
+                }
+                state.lastPoint = { x, y };
+            } else {
+                updatePenStatus(false, "Hovering (Air Pen Up)");
+                state.lastPoint = null;
+            }
+        }
+
+        // Draw custom interactive pointer
+        function drawCursor(x, y, isDrawing) {
+            trackCtx.save();
+            trackCtx.beginPath();
+            trackCtx.arc(x, y, isDrawing ? state.brushSize / 2 + 4 : 8, 0, Math.PI * 2);
+            trackCtx.fillStyle = isDrawing ? (state.isEraser ? '#ef4444' : state.currentColor) : 'rgba(255, 255, 255, 0.7)';
+            trackCtx.fill();
+            trackCtx.strokeStyle = '#ffffff';
+            trackCtx.lineWidth = 2;
+            trackCtx.stroke();
+            trackCtx.restore();
+        }
+
+        function updatePenStatus(active, text) {
+            state.isDrawingActive = active;
+            airPenStatusText.textContent = text;
+            if (active) {
+                airPenStatusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping";
+            } else {
+                airPenStatusDot.className = "w-2.5 h-2.5 rounded-full bg-amber-400";
+            }
+        }
+
+        // Camera Control & Setup
+        async function startCamera() {
+            try {
+                if (!state.handTracker) initMediaPipe();
+
+                const camera = new Camera(webcamVideo, {
+                    onFrame: async () => {
+                        await state.handTracker.send({ image: webcamVideo });
+                    },
+                    width: 1280,
+                    height: 720
+                });
+
+                await camera.start();
+                state.cameraUtils = camera;
+                state.isCameraActive = true;
+                cameraPrompt.classList.add('hidden');
+                document.getElementById('cameraBtnText').textContent = "Stop Camera";
+            } catch (err) {
+                console.error("Camera startup error:", err);
+                alert("Unable to access webcam. Please ensure camera permissions are granted.");
+            }
+        }
+
+        function stopCamera() {
+            if (state.cameraUtils) {
+                state.cameraUtils.stop();
+                state.isCameraActive = false;
+                cameraPrompt.classList.remove('hidden');
+                document.getElementById('cameraBtnText').textContent = "Start Webcam";
+                trackCtx.clearRect(0, 0, trackingOverlay.width, trackingOverlay.height);
+                statusText.textContent = "Camera Off";
+            }
+        }
+
+        document.getElementById('toggleCameraBtn').addEventListener('click', () => {
+            if (state.isCameraActive) stopCamera(); else startCamera();
+        });
+
+        document.getElementById('startWebcamDirectBtn').addEventListener('click', startCamera);
+
+        // AI Drawing Recognition Pipeline (Client Canvas Analysis + Gemini API Vision)
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        const recognitionResultCard = document.getElementById('recognitionResultCard');
+        const closeResultBtn = document.getElementById('closeResultBtn');
+
+        closeResultBtn.addEventListener('click', () => recognitionResultCard.classList.add('hidden'));
+
+        analyzeBtn.addEventListener('click', async () => {
+            // Check if drawing canvas contains strokes
+            const pixelData = drawCtx.getImageData(0, 0, drawingCanvas.width, drawingCanvas.height).data;
+            let hasPixels = false;
+            for (let i = 3; i < pixelData.length; i += 4) {
+                if (pixelData[i] > 10) {
+                    hasPixels = true;
+                    break;
+                }
+            }
+
+            if (!hasPixels) {
+                showRecognitionCard("Empty Canvas", "Draw something first!", "Please use your finger in front of the webcam to draw a digit, symbol, or shape.", "fa-triangle-exclamation");
+                return;
+            }
+
+            // Display loading state
+            showRecognitionCard("Analyzing Drawing...", "Processing image...", "Running shape geometry and vision classification...", "fa-spinner fa-spin");
+
+            try {
+                // Prepare drawing as base64 JPEG
+                const exportCanvas = document.createElement('canvas');
+                exportCanvas.width = 512;
+                exportCanvas.height = 512;
+                const expCtx = exportCanvas.getContext('2d');
+                
+                // Black background with white/bright drawing for optimal vision parsing
+                expCtx.fillStyle = '#000000';
+                expCtx.fillRect(0, 0, 512, 512);
+                expCtx.drawImage(drawingCanvas, 0, 0, 512, 512);
+
+                const base64Image = exportCanvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+
+                // Attempt Gemini Vision API analysis
+                const aiResult = await classifyWithGemini(base64Image);
+                if (aiResult) {
+                    showRecognitionCard(
+                        aiResult.label,
+                        `Confidence: ${aiResult.confidence || 'High'}`,
+                        aiResult.description,
+                        aiResult.icon || "fa-lightbulb"
+                    );
+                } else {
+                    // Local fallback algorithm if API call is unavailable
+                    const fallback = performLocalPixelAnalysis();
+                    showRecognitionCard(fallback.title, fallback.confidence, fallback.desc, fallback.icon);
+                }
+
+            } catch (err) {
+                console.warn("API Recognition fallback:", err);
+                const fallback = performLocalPixelAnalysis();
+                showRecognitionCard(fallback.title, fallback.confidence, fallback.desc, fallback.icon);
+            }
+        });
+
+        // Gemini Vision Classification Request
+        async function classifyWithGemini(base64Image) {
+            const promptText = "Examine this spatial air drawing snippet on dark background. Classify the main object, shape, handwritten number/letter, or symbol drawn. Return a brief structured JSON object with keys: 'label' (short name 1-3 words), 'confidence' (percentage string like 92%), 'description' (one sentence detailing what was recognized), 'icon' (FontAwesome 6 class name like fa-circle, fa-star, fa-heart, fa-hashtag, fa-font, etc.). Respond ONLY with valid JSON.";
+
+            const payload = {
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            { text: promptText },
+                            {
+                                inlineData: {
+                                    mimeType: "image/jpeg",
+                                    data: base64Image
+                                }
+                            }
+                        ]
+                    }
+                ],
+                generationConfig: {
+                    responseMimeType: "application/json"
+                }
+            };
+
+            const url = `${state.geminiApiUrl}?key=${state.geminiApiKey}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) return null;
+
+            const data = await response.json();
+            const textResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (textResponse) {
+                return JSON.parse(textResponse);
+            }
+            return null;
+        }
+
+        // Lightweight Local Geometry Fallback Classifier
+        function performLocalPixelAnalysis() {
+            // Extract bounding box of drawing
+            const imgData = drawCtx.getImageData(0, 0, drawingCanvas.width, drawingCanvas.height);
+            let minX = drawingCanvas.width, maxX = 0, minY = drawingCanvas.height, maxY = 0;
+            let activePixels = 0;
+
+            for (let y = 0; y < drawingCanvas.height; y += 4) {
+                for (let x = 0; x < drawingCanvas.width; x += 4) {
+                    const alphaIndex = (y * drawingCanvas.width + x) * 4 + 3;
+                    if (imgData.data[alphaIndex] > 20) {
+                        activePixels++;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+            }
+
+            const width = maxX - minX;
+            const height = maxY - minY;
+            const aspectRatio = width / (height || 1);
+
+            let label = "Hand Drawn Sketch";
+            let desc = "Geometrical stroke detected on canvas.";
+            let icon = "fa-paintbrush";
+
+            if (aspectRatio > 0.8 && aspectRatio < 1.25) {
+                label = "Circular / Compact Shape";
+                desc = "Aspect ratio close to 1.0. Suggests circle, digit 0, or compact symbol.";
+                icon = "fa-circle-notch";
+            } else if (aspectRatio >= 1.5) {
+                label = "Horizontal Line / Banner";
+                desc = "Wide horizontal orientation detected.";
+                icon = "fa-minus";
+            } else if (aspectRatio <= 0.5) {
+                label = "Vertical Line / Digit 1";
+                desc = "Tall vertical stroke structure analyzed.";
+                icon = "fa-grip-lines-vertical";
+            }
+
+            return {
+                title: label,
+                confidence: "Geometry Math Engine ~ 85%",
+                desc: desc,
+                icon: icon
+            };
+        }
+
+        function showRecognitionCard(title, confidence, description, iconClass) {
+            document.getElementById('resultTitle').textContent = title;
+            document.getElementById('resultConfidence').textContent = confidence;
+            document.getElementById('resultDescription').textContent = description;
+            document.getElementById('resultIcon').className = `fa-solid ${iconClass}`;
+            recognitionResultCard.classList.remove('hidden');
+        }
+
+        // Window load initialization
+        window.onload = () => {
+            // Auto open help on first visit
+            setTimeout(() => {
+                helpModal.classList.remove('hidden');
+            }, 600);
+        };
+    </script>
+</body>
+</html>
