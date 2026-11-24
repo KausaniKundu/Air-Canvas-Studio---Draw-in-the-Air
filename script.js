@@ -1,220 +1,332 @@
-/* =====================================================================
-   Air Canvas Precision Module
-   Fixes: shaky lines, broken/disconnected strokes, pen flicker on/off.
-   Works with MediaPipe Hands (landmark 8 = index fingertip).
-   Drop this in BEFORE your main script, then follow the 3 steps at the bottom.
-   ===================================================================== */
-(function (global) {
-  const CFG = {
-    // One Euro filter: lower minCutoff = smoother when slow, higher beta = less lag when fast
-    minCutoff: 1.5,
-    beta: 0.02,
-    dCutoff: 1.0,
-    // Pen state (hysteresis) so the pen doesn't flicker
-    penDownFrames: 2,      // frames the gesture must hold before pen goes down
-    penUpGraceMs: 160,     // gesture may break this long before the stroke is paused
-    lostHandGraceMs: 220,  // hand may vanish this long before the stroke is ended
-    // Pinch mode (distance / hand size) with hysteresis
-    pinchOn: 0.22,
-    pinchOff: 0.38,
-    // Reject tracking glitches (teleporting landmark)
-    maxJumpPx: 220,
-    maxGlitchFrames: 2,
+// Application State
+const state = {
+  currentColor: '#22d3ee',
+  brushSize: 8,
+  isDrawing: false,
+  lastPoint: null,
+  strokes: [],
+  currentStroke: []
+};
+
+// DOM Elements
+const videoElement = document.getElementById('webcam');
+const canvasElement = document.getElementById('paintCanvas');
+const ctx = canvasElement.getContext('2d');
+const statusBadge = document.getElementById('statusBadge');
+const statusText = document.getElementById('statusText');
+const brushSizeInput = document.getElementById('brushSize');
+const brushSizeVal = document.getElementById('brushSizeVal');
+const customColorInput = document.getElementById('customColor');
+const colorBtns = document.querySelectorAll('.color-btn');
+const clearBtn = document.getElementById('clearBtn');
+const recognizeBtn = document.getElementById('recognizeBtn');
+const resultModal = document.getElementById('resultModal');
+const resultShape = document.getElementById('resultShape');
+const resultConfidence = document.getElementById('resultConfidence');
+const closeModalBtn = document.getElementById('closeModalBtn');
+
+function setStatus(text, dotClass) {
+  statusText.innerText = text;
+  statusBadge.querySelector('span').className = `w-2 h-2 rounded-full ${dotClass}`;
+}
+
+// Match canvas resolution to its container
+function resizeCanvas() {
+  const rect = canvasElement.parentElement.getBoundingClientRect();
+  canvasElement.width = rect.width;
+  canvasElement.height = rect.height;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// "Cover" rectangle: where the video frame lands on the canvas
+function getCoverRect() {
+  const vw = videoElement.videoWidth;
+  const vh = videoElement.videoHeight;
+  const cw = canvasElement.width;
+  const ch = canvasElement.height;
+  if (!vw || !vh) return null;
+  const scale = Math.max(cw / vw, ch / vh);
+  const dw = vw * scale;
+  const dh = vh * scale;
+  return { dx: (cw - dw) / 2, dy: (ch - dh) / 2, dw, dh };
+}
+
+// Draw the mirrored webcam frame as the canvas background
+function drawVideoFrame() {
+  const r = getCoverRect();
+  if (!r) return;
+  ctx.save();
+  ctx.translate(canvasElement.width, 0);
+  ctx.scale(-1, 1); // mirror
+  ctx.drawImage(videoElement, r.dx, r.dy, r.dw, r.dh);
+  ctx.restore();
+  // slight dim so strokes stand out
+  ctx.fillStyle = 'rgba(2, 6, 23, 0.25)';
+  ctx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+}
+
+// Convert a normalized landmark to mirrored canvas coordinates
+function toCanvasPoint(lm) {
+  const r = getCoverRect();
+  if (!r) return { x: (1 - lm.x) * canvasElement.width, y: lm.y * canvasElement.height };
+  return {
+    x: canvasElement.width - (lm.x * r.dw + r.dx),
+    y: lm.y * r.dh + r.dy
   };
+}
 
-  /* ---------- One Euro filter ---------- */
-  class LowPass {
-    constructor() { this.y = null; }
-    filter(x, a) { this.y = this.y === null ? x : a * x + (1 - a) * this.y; return this.y; }
+// Initialize MediaPipe Hands
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.7
+});
+hands.onResults(onResults);
+
+// Start webcam directly with getUserMedia (gives real error messages)
+async function startCamera() {
+  if (!window.isSecureContext) {
+    setStatus('Open via http://localhost (not file://)', 'bg-rose-500');
+    return;
   }
-  class OneEuro {
-    constructor(minCutoff, beta, dCutoff) {
-      this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
-      this.reset();
-    }
-    reset() { this.x = new LowPass(); this.dx = new LowPass(); this.tPrev = null; this.xPrev = null; }
-    _alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
-    filter(x, tMs) {
-      if (this.tPrev === null) {
-        this.tPrev = tMs; this.xPrev = x; this.x.y = x; this.dx.y = 0; return x;
-      }
-      const dt = Math.max((tMs - this.tPrev) / 1000, 1e-3);
-      const rawVel = (x - this.xPrev) / dt;
-      const vel = this.dx.filter(rawVel, this._alpha(this.dCutoff, dt));
-      const cutoff = this.minCutoff + this.beta * Math.abs(vel);
-      const out = this.x.filter(x, this._alpha(cutoff, dt));
-      this.tPrev = tMs; this.xPrev = x;
-      return out;
-    }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('Browser has no camera support', 'bg-rose-500');
+    return;
   }
 
-  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-
-  /* ---------- Pen controller ---------- */
-  class PrecisionPen {
-    constructor(cfg = {}) {
-      this.cfg = Object.assign({}, CFG, cfg);
-      this.fx = new OneEuro(this.cfg.minCutoff, this.cfg.beta, this.cfg.dCutoff);
-      this.fy = new OneEuro(this.cfg.minCutoff, this.cfg.beta, this.cfg.dCutoff);
-      this.down = false;      // stroke is active
-      this.streak = 0;        // consecutive frames gesture is true
-      this.lastWantT = 0;
-      this.lastSeenT = 0;
-      this.pinching = false;
-      this.lastRaw = null;
-      this.glitches = 0;
-    }
-
-    _fingerExtended(lm, tip, pip) {
-      return dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.05;
-    }
-    _fingerCurled(lm, tip, pip) {
-      return dist(lm[tip], lm[0]) < dist(lm[pip], lm[0]) * 1.02;
-    }
-
-    _wantDraw(lm, mode) {
-      if (mode === 'pinch') {
-        const size = dist(lm[0], lm[9]) || 1e-6;
-        const ratio = dist(lm[4], lm[8]) / size;
-        if (this.pinching) { if (ratio > this.cfg.pinchOff) this.pinching = false; }
-        else if (ratio < this.cfg.pinchOn) this.pinching = true;
-        return this.pinching;
-      }
-      // Index-finger mode: index up, and at least 2 of the other 3 fingers curled
-      const indexUp = this._fingerExtended(lm, 8, 6);
-      const curled = [[12, 10], [16, 14], [20, 18]]
-        .filter(([t, p]) => this._fingerCurled(lm, t, p)).length;
-      return indexUp && curled >= 2;
-    }
-
-    /**
-     * @param lm        results.multiHandLandmarks[0] or null
-     * @param tMs       performance.now()
-     * @param w,h       canvas width/height in pixels
-     * @param mirrored  true if you flip the video horizontally
-     * @param mode      'index' or 'pinch'
-     * @returns {type: 'start'|'move'|'hold'|'end'|'hover'|'none', x, y}
-     */
-    update(lm, tMs, w, h, mirrored, mode = 'index') {
-      // Hand lost: keep the stroke alive briefly instead of cutting the line
-      if (!lm) {
-        if (this.down && tMs - this.lastSeenT > this.cfg.lostHandGraceMs) {
-          this.down = false; this.streak = 0;
-          return { type: 'end' };
-        }
-        return { type: this.down ? 'hold' : 'none' };
-      }
-      this.lastSeenT = tMs;
-
-      // Raw fingertip in canvas pixels
-      let rx = lm[8].x * w;
-      const ry = lm[8].y * h;
-      if (mirrored) rx = w - rx;
-
-      // Glitch rejection (single-frame landmark teleports)
-      if (this.lastRaw && Math.hypot(rx - this.lastRaw.x, ry - this.lastRaw.y) > this.cfg.maxJumpPx) {
-        if (this.glitches < this.cfg.maxGlitchFrames) {
-          this.glitches++;
-          return { type: this.down ? 'hold' : 'hover' };
-        }
-        // Real fast move: accept it and restart the filter there
-        this.fx.reset(); this.fy.reset();
-      }
-      this.glitches = 0;
-      this.lastRaw = { x: rx, y: ry };
-
-      const x = this.fx.filter(rx, tMs);
-      const y = this.fy.filter(ry, tMs);
-
-      // Pen state with hysteresis
-      const want = this._wantDraw(lm, mode);
-      if (want) { this.streak++; this.lastWantT = tMs; } else { this.streak = 0; }
-
-      if (!this.down) {
-        if (this.streak >= this.cfg.penDownFrames) {
-          this.down = true;
-          return { type: 'start', x, y };
-        }
-        return { type: 'hover', x, y };
-      }
-      if (!want && tMs - this.lastWantT > this.cfg.penUpGraceMs) {
-        this.down = false;
-        return { type: 'end', x, y };
-      }
-      // Gesture briefly broken: pause drawing but keep the stroke connected
-      if (!want) return { type: 'hold', x, y };
-      return { type: 'move', x, y };
-    }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    videoElement.srcObject = stream;
+    await videoElement.play();
+  } catch (err) {
+    console.error('Camera error:', err);
+    const messages = {
+      NotAllowedError: 'Camera permission blocked',
+      NotFoundError: 'No camera found',
+      NotReadableError: 'Camera in use by another app',
+      OverconstrainedError: 'Camera does not support resolution'
+    };
+    setStatus(messages[err.name] || `Camera error: ${err.name}`, 'bg-rose-500');
+    return;
   }
 
-  /* ---------- Smooth stroke renderer (no gaps, no jagged corners) ---------- */
-  class StrokeRenderer {
-    constructor(ctx) { this.ctx = ctx; this.prev = null; this.lastMid = null; }
-    _dot(x, y) {
-      const c = this.ctx;
-      c.save();
-      c.beginPath();
-      c.arc(x, y, c.lineWidth / 2, 0, Math.PI * 2);
-      c.fillStyle = c.strokeStyle;
-      c.fill();
-      c.restore();
-    }
-    begin(x, y) {
-      const c = this.ctx;
-      c.lineCap = 'round'; c.lineJoin = 'round';
-      this.prev = { x, y }; this.lastMid = { x, y };
-      this._dot(x, y);
-    }
-    add(x, y) {
-      if (!this.prev) return this.begin(x, y);
-      const c = this.ctx;
-      const mid = { x: (this.prev.x + x) / 2, y: (this.prev.y + y) / 2 };
-      c.beginPath();
-      c.moveTo(this.lastMid.x, this.lastMid.y);
-      c.quadraticCurveTo(this.prev.x, this.prev.y, mid.x, mid.y);
-      c.stroke();
-      this.lastMid = mid; this.prev = { x, y };
-    }
-    end() {
-      if (!this.prev) return;
-      const c = this.ctx;
-      c.beginPath();
-      c.moveTo(this.lastMid.x, this.lastMid.y);
-      c.lineTo(this.prev.x, this.prev.y);
-      c.stroke();
-      this.prev = null; this.lastMid = null;
-    }
+  setStatus('Loading hand model...', 'bg-amber-400 animate-pulse');
+  try {
+    await hands.initialize();
+  } catch (err) {
+    console.error('MediaPipe load error:', err);
+    setStatus('Hand model failed to load (check internet)', 'bg-rose-500');
+    return;
   }
 
-  global.PrecisionPen = PrecisionPen;
-  global.StrokeRenderer = StrokeRenderer;
-})(window);
+  setStatus('Tracking Active', 'bg-emerald-400');
+  processFrames();
+}
 
-/* =====================================================================
-   HOW TO WIRE IT IN (3 steps)
+let busy = false;
+async function processFrames() {
+  if (!busy && videoElement.readyState >= 2) {
+    busy = true;
+    try {
+      await hands.send({ image: videoElement });
+    } catch (e) {
+      console.error(e);
+    }
+    busy = false;
+  }
+  requestAnimationFrame(processFrames);
+}
 
-   1) MediaPipe options (more accurate tracking):
-        hands.setOptions({
-          maxNumHands: 1,
-          modelComplexity: 1,            // 1 = most accurate
-          minDetectionConfidence: 0.7,
-          minTrackingConfidence: 0.7,
-        });
-      Camera / video size:  width: 1280, height: 720
+// Process Hand Landmarks (runs every frame, with or without a hand)
+function onResults(results) {
+  redrawCanvas();
 
-   2) Create once, after your drawing canvas context exists:
-        const pen = new PrecisionPen();
-        const stroke = new StrokeRenderer(drawCtx);   // drawCtx = the canvas you draw on
-        // Set drawCtx.strokeStyle / lineWidth / shadowBlur from your colour + width sliders as usual.
-        // IMPORTANT: draw on a separate persistent canvas; never clear it every frame.
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+    if (state.isDrawing && state.currentStroke.length > 0) {
+      state.strokes.push([...state.currentStroke]);
+      state.currentStroke = [];
+    }
+    state.isDrawing = false;
+    state.lastPoint = null;
+    return;
+  }
 
-   3) Inside your hands.onResults(results) replace the old draw logic with:
-        const lm  = results.multiHandLandmarks && results.multiHandLandmarks[0];
-        const mode = 'index';                     // or 'pinch' to match your Drawing Mode selector
-        const r = pen.update(lm, performance.now(), drawCanvas.width, drawCanvas.height, true, mode);
-        if (r.type === 'start')      stroke.begin(r.x, r.y);
-        else if (r.type === 'move')  stroke.add(r.x, r.y);
-        else if (r.type === 'end')   stroke.end();
-        // 'hover' -> just move your cursor dot to r.x, r.y (don't draw)
-        // 'hold'  -> do nothing; the stroke stays connected and resumes
-   ===================================================================== */
+  const landmarks = results.multiHandLandmarks[0];
+  const indexTip = landmarks[8];
+  const indexPip = landmarks[6];
+  const middleTip = landmarks[12];
+  const middlePip = landmarks[10];
+
+  const { x, y } = toCanvasPoint(indexTip);
+
+  const isIndexUp = indexTip.y < indexPip.y;
+  const isMiddleUp = middleTip.y < middlePip.y;
+
+  if (isIndexUp && !isMiddleUp) {
+    if (!state.isDrawing) {
+      state.isDrawing = true;
+      state.currentStroke = [];
+    }
+
+    const currentPoint = { x, y, color: state.currentColor, size: state.brushSize };
+    state.currentStroke.push(currentPoint);
+    state.lastPoint = currentPoint;
+
+    redrawStrokesOnly();
+    drawCursor(x, y, state.currentColor, true);
+  } else {
+    if (state.isDrawing && state.currentStroke.length > 0) {
+      state.strokes.push([...state.currentStroke]);
+      state.currentStroke = [];
+    }
+    state.isDrawing = false;
+    state.lastPoint = null;
+
+    if (isIndexUp && isMiddleUp) {
+      drawCursor(x, y, '#fbbf24', false);
+    }
+  }
+}
+
+function drawCursor(x, y, color, isDrawing) {
+  ctx.beginPath();
+  ctx.arc(x, y, isDrawing ? state.brushSize / 2 + 4 : 8, 0, 2 * Math.PI);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function drawStrokes() {
+  const allStrokes = [...state.strokes, state.currentStroke];
+  allStrokes.forEach(stroke => {
+    if (stroke.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(stroke[0].x, stroke[0].y);
+    ctx.strokeStyle = stroke[0].color;
+    ctx.lineWidth = stroke[0].size;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let i = 1; i < stroke.length; i++) {
+      ctx.lineTo(stroke[i].x, stroke[i].y);
+    }
+    ctx.stroke();
+  });
+}
+
+// Full redraw: video + strokes
+function redrawCanvas() {
+  ctx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  drawVideoFrame();
+  drawStrokes();
+}
+
+// Redraw after adding a point (video + strokes, so the live stroke shows)
+function redrawStrokesOnly() {
+  ctx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  drawVideoFrame();
+  drawStrokes();
+}
+
+// Controls Logic
+colorBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    colorBtns.forEach(b => b.classList.replace('border-white', 'border-transparent'));
+    btn.classList.replace('border-transparent', 'border-white');
+    state.currentColor = btn.dataset.color;
+    customColorInput.value = state.currentColor;
+  });
+});
+
+customColorInput.addEventListener('input', (e) => {
+  state.currentColor = e.target.value;
+  colorBtns.forEach(b => b.classList.replace('border-white', 'border-transparent'));
+});
+
+brushSizeInput.addEventListener('input', (e) => {
+  state.brushSize = parseInt(e.target.value);
+  brushSizeVal.innerText = `${state.brushSize}px`;
+});
+
+clearBtn.addEventListener('click', () => {
+  state.strokes = [];
+  state.currentStroke = [];
+  state.lastPoint = null;
+});
+
+// Heuristic Recognition Engine
+recognizeBtn.addEventListener('click', () => {
+  const points = state.strokes.flat();
+  if (points.length < 10) {
+    showResult('Not Enough Data', 0);
+    return;
+  }
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  points.forEach(p => {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  });
+
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const aspectRatio = width / height;
+
+  const centerX = minX + width / 2;
+  const centerY = minY + height / 2;
+
+  let totalRadius = 0;
+  points.forEach(p => {
+    totalRadius += Math.hypot(p.x - centerX, p.y - centerY);
+  });
+  const avgRadius = totalRadius / points.length;
+
+  let radiusVariance = 0;
+  points.forEach(p => {
+    radiusVariance += Math.pow(Math.hypot(p.x - centerX, p.y - centerY) - avgRadius, 2);
+  });
+  const stdDev = Math.sqrt(radiusVariance / points.length);
+  const circularityScore = stdDev / avgRadius;
+
+  let detectedShape = 'Unknown Shape';
+  let confidence = 75;
+
+  if (circularityScore < 0.22 && aspectRatio > 0.75 && aspectRatio < 1.35) {
+    detectedShape = 'Circle';
+    confidence = Math.round((1 - circularityScore) * 100);
+  } else if (aspectRatio >= 0.85 && aspectRatio <= 1.15) {
+    detectedShape = 'Square';
+    confidence = 88;
+  } else if (aspectRatio > 1.4 || aspectRatio < 0.4) {
+    detectedShape = 'Line / Rectangle';
+    confidence = 82;
+  } else if (state.strokes.length === 3 || state.strokes.length === 1) {
+    detectedShape = 'Triangle';
+    confidence = 79;
+  }
+
+  showResult(detectedShape, Math.min(confidence, 98));
+});
+
+function showResult(shape, conf) {
+  resultShape.innerText = shape;
+  resultConfidence.innerText = `Confidence: ${conf}%`;
+  resultModal.classList.remove('hidden');
+}
+
+closeModalBtn.addEventListener('click', () => {
+  resultModal.classList.add('hidden');
+});
+
+startCamera();
